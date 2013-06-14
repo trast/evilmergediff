@@ -97,7 +97,9 @@ def detect_evilness(M, A, B, Y):
     #     modified on A..M and B..M, too.
     #
     # (2) If a file has been changed on exactly one of Y..A or Y..B,
-    #     then the merge should have taken the *changed* version.
+    #     then the merge should not have taken the unchanged version.
+    #     (Usually M took the changed one, but if it is completely
+    #     new, --cc will show that so we are happy, too.)
     #
     # FIXME: need to think about what happens in rename detection
     # cases
@@ -119,16 +121,17 @@ def detect_evilness(M, A, B, Y):
         elif f not in dBM:
             suspects.append((f, 'modified in both, took ^2'))
     # case (2)
-    def case2_helper(changed_x, dYx, dxM, cause):
+    def case2_helper(changed_x, dYx, dyM, cause):
         for f in changed_x:
             fY, fx = dYx[f]
-            if f not in dxM:
-                continue
-            fx, fM = dxM[f]
-            if fM != fx: # a mode change could fool us
+            if f not in dyM:
                 suspects.append((f, cause))
-    case2_helper(changed_A, dYA, dAM, 'modified in ^1,   took ^2')
-    case2_helper(changed_B, dYB, dBM, 'modified in ^2,   took ^1')
+                continue
+            fy, fM = dyM[f]
+            if fM == fy: # a mode change could fool us
+                suspects.append((f, cause))
+    case2_helper(changed_A, dYA, dBM, 'modified in ^1,   took ^2')
+    case2_helper(changed_B, dYB, dAM, 'modified in ^2,   took ^1')
     suspects.sort()
     return suspects
 

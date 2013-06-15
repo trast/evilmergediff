@@ -22,8 +22,9 @@ at a hunk level.'''
 import sys
 import subprocess
 import optparse
+from collections import defaultdict
 
-usage = '%prog <merge> [ <parent1> <parent2> [--] [<mergebase>] ]'
+usage = '%prog <merge> [ <parent1> <parent2> [--] [<mergebase>...] ]'
 description = '''\
 Show whether <merge> contains any candidates for file-level evilness.
 The remaining args are optional, but the merge base in particular is
@@ -44,94 +45,112 @@ def get_parents(commit):
     out = subprocess.check_output(['git', 'rev-parse', commit+'^1', commit+'^2'])
     return out.strip().split()
 
-def diff_tree(cmt1, cmt2):
+def ls_tree(cmt):
     '''Call git-diff-tree and parse results
 
     The return value is a sequence with each element of the form
     (oldmode, newmode, oldhash, newhash, status, filename).
 
     FIXME: should convert to streaming input'''
-    p = subprocess.Popen(['git', 'diff-tree', '-r', '-z', cmt1, cmt2],
+    p = subprocess.Popen(['git', 'ls-tree', '-r', '-z', cmt],
                          stdout=subprocess.PIPE)
     data = p.stdout.read()
-    chunks = data.split('\0')
-    for meta, filename in zip(chunks[::2], chunks[1::2]):
-        mode1, mode2, hash1, hash2, status = meta.split()
-        yield (mode1, mode2, hash1, hash2, status, filename)
+    for line in data.split('\0'):
+        if not line: # last element is empty
+            continue
+        meta, filename = line.split('\t', 1)
+        mode, type, sha = meta.split()
+        yield (mode, sha, filename)
     ret = p.wait()
     assert ret == 0
 
-def simple_diff_tree(cmt1, cmt2):
-    '''Like diff_tree, but the result is a dict {filename:(oldhash,newhash)}.'''
-    ret = {}
-    # print "DEBUG: tree diff %s - %s" % (cmt1[:7], cmt2[:7])
-    for mode1, mode2, hash1, hash2, status, filename in diff_tree(cmt1, cmt2):
-        ret[filename] = (hash1, hash2)
-    # for k,(h1,h2) in sorted(ret.items()):
-    #     print "%s %s   %s" % (h1[:7], h2[:7], k)
+# By convention the null sha1 is used to represent nonexistent files.
+# We could use anything here, however.
+nonexistent = '0'*40
+
+def dict_ls_tree(cmt):
+    '''Like ls_tree, but the result is a magic dict {filename:hash}.
+
+    The magic part is that it is a defaultdict, returning the
+    customary "absent" null sha1 if you ask for a file that was not in
+    that tree.'''
+    ret = defaultdict(lambda : nonexistent)
+    for mode, sha, filename in ls_tree(cmt):
+        ret[filename] = sha
+    return ret, set(ret.keys())
+
+def find_changed(fileset, tree1, tree2):
+    ret = set()
+    for f in fileset:
+        if tree1[f] != tree2[f]:
+            ret.add(f)
     return ret
 
 def die(fmt, *fmtargs):
     sys.stderr.write(fmt % fmtargs)
     sys.exit(1)
 
-def detect_evilness(M, A, B, Y):
-    # print 'M', M
-    # print 'A', A
-    # print 'B', B
-    # print 'Y', Y
+def detect_evilness(M, A, B, bases):
     # History looks like this on a high level:
     #
     #    M
     #   / \
     #  A   B
     #   \ /
-    #    Y
+    #    Y1, Y2, ...
     #
-    # We look at two suspect cases:
     #
-    # (1) If a file has been changed on Y..A, and also changed on
-    #     Y..B, there should have been a file-level merge to build M.
-    #     For such candidate files, the merge should have been
-    #     nontrivial at the file level, i.e., the file should be
-    #     modified on A..M and B..M, too.
+    # Obviously files are only interesting if A and B do not all have
+    # the same content (otherwise the merge was trivial).
     #
-    # (2) If a file has been changed on exactly one of Y..A or Y..B,
-    #     then the merge should not have taken the unchanged version.
-    #     (Usually M took the changed one, but if it is completely
-    #     new, --cc will show that so we are happy, too.)
+    # There are two suspect cases, for any given file:
+    #
+    # (1) M agrees with A or B, but neither of them matches any
+    #     merge-base.  In this case there should have been a
+    #     nontrivial file-level merge.
+    #
+    # (2) M agrees with A (or B), but B (or A, resp.) does not match
+    #     any merge-base.
+    #
+    # Actually (1) is a special case of (2).  However, I find it helps
+    # to distinguish them and label them as
+    # (1) modified in both, took <side>
+    # (2) modified in <side>, took <other side>
     #
     # FIXME: need to think about what happens in rename detection
     # cases
     suspects = []
-    dYA = simple_diff_tree(Y, A)
-    dYB = simple_diff_tree(Y, B)
-    dAM = simple_diff_tree(A, M)
-    dBM = simple_diff_tree(B, M)
-    # split the files into groups
-    set_dYA = set(dYA.keys())
-    set_dYB = set(dYB.keys())
-    changed_AB = set_dYA.intersection(set_dYB)
-    changed_A = set_dYA.difference(set_dYB)
-    changed_B = set_dYB.difference(set_dYA)
+    treeM, filesM = dict_ls_tree(M)
+    treeA, filesA = dict_ls_tree(A)
+    treeB, filesB = dict_ls_tree(B)
+    treeY, filesY = zip(*[dict_ls_tree(Y) for Y in bases])
+    # We only care about files that are in at least one of M, A and B
+    files_MAB = filesM.union(filesA).union(filesB)
+    # and from those, only files that do not agree among all parents
+    files_changed = (find_changed(files_MAB, treeA, treeM)
+                     | find_changed(files_MAB, treeB, treeM))
     # case (1)
-    for f in changed_AB:
-        if f not in dAM:
+    for f in files_changed:
+        if any(treeA[f] == t[f] for t in treeY):
+            continue
+        if any(treeB[f] == t[f] for t in treeY):
+            continue
+        if treeM[f] == treeA[f]:
             suspects.append((f, 'modified in both, took ^1'))
-        elif f not in dBM:
+        elif treeM[f] == treeB[f]:
             suspects.append((f, 'modified in both, took ^2'))
+    # don't look at the same files again
+    files_changed.difference_update(f for f,reason in suspects)
     # case (2)
-    def case2_helper(changed_x, dYx, dyM, cause):
-        for f in changed_x:
-            fY, fx = dYx[f]
-            if f not in dyM:
-                suspects.append((f, cause))
+    def case2_helper(side1, side2, cause):
+        for f in files_changed:
+            if side1[f] != treeM[f]:
                 continue
-            fy, fM = dyM[f]
-            if fM == fy: # a mode change could fool us
-                suspects.append((f, cause))
-    case2_helper(changed_A, dYA, dBM, 'modified in ^1,   took ^2')
-    case2_helper(changed_B, dYB, dAM, 'modified in ^2,   took ^1')
+            if any(side2[f] == t[f] for t in treeY):
+                continue
+            suspects.append((f, cause))
+    case2_helper(treeA, treeB, 'modified in ^2,   took ^1')
+    case2_helper(treeB, treeA, 'modified in ^1,   took ^2')
     suspects.sort()
     return suspects
 
@@ -139,7 +158,7 @@ def detect_evilness(M, A, B, Y):
 def process_args(args, unhandled_fatal=True):
     if len(args) > 3 and args[3] == '--':
         del args[3]
-    if len(args) < 1 or len(args) > 4:
+    if len(args) < 1:
         if not unhandled_fatal:
             return
         parser.print_usage()
@@ -147,13 +166,13 @@ def process_args(args, unhandled_fatal=True):
     merge = args[0]
     parent1 = None
     parent2 = None
-    base = None
+    bases = None
     if len(args) > 1:
         parent1 = args[1]
     if len(args) > 2:
         parent2 = args[2]
     if len(args) > 3:
-        base = args[3]
+        bases = args[3:]
     if not parent1 or not parent2:
         try:
             parent1, parent2 = get_parents(merge)
@@ -161,15 +180,9 @@ def process_args(args, unhandled_fatal=True):
             if not unhandled_fatal:
                 return
             die('%s does not appear to be a merge\n', merge)
-    if not base:
+    if not bases:
         bases = get_merge_bases(parent1, parent2)
-        if len(bases) != 1:
-            if not unhandled_fatal:
-                return
-            die("%s and %s have multiple merge bases; I don't handle this yet\n",
-                parent1, parent2)
-        base = bases[0]
-    suspects = detect_evilness(merge, parent1, parent2, base)
+    suspects = detect_evilness(merge, parent1, parent2, bases)
     if suspects:
         print "commit %s" % merge
         print "suspicious merge in files:"

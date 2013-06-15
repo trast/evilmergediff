@@ -38,8 +38,14 @@ parser.add_option('--stdin', default=False, action='store_true', dest='stdin',
                   help='Read arguments from stdin (one set of args per line)')
 
 def get_merge_bases(cmt1, cmt2):
-    out = subprocess.check_output(['git', 'merge-base', '--all', cmt1, cmt2])
-    return out.strip().split()
+    try:
+        out = subprocess.check_output(['git', 'merge-base', '--all', cmt1, cmt2])
+        return out.strip().split()
+    except subprocess.CalledProcessError, e:
+        # merge-base fails with status 1 if there are no bases
+        if e.returncode == 1:
+            return []
+        raise
 
 def get_parents(commit):
     out = subprocess.check_output(['git', 'rev-parse', commit+'^1', commit+'^2'])
@@ -123,7 +129,13 @@ def detect_evilness(M, A, B, bases):
     treeM, filesM = dict_ls_tree(M)
     treeA, filesA = dict_ls_tree(A)
     treeB, filesB = dict_ls_tree(B)
-    treeY, filesY = zip(*[dict_ls_tree(Y) for Y in bases])
+    if bases:
+        treeY, filesY = zip(*[dict_ls_tree(Y) for Y in bases])
+    else:
+        # if the ancestries are disjoint, we pretend as if there was a
+        # merge base with an empty tree
+        treeY = [defaultdict(lambda : nonexistent)]
+        filesY = [set([])]
     # We only care about files that are in at least one of M, A and B
     files_MAB = filesM.union(filesA).union(filesB)
     # and from those, only files that do not agree among all parents

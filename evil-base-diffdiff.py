@@ -120,6 +120,20 @@ def any_suspicious_lines(diff):
             return True
     return False
 
+
+def remove_common_hunks(d1, d2):
+    d1new = dict(d1)
+    d2new = dict(d2)
+    f1 = set(d1.keys())
+    f2 = set(d2.keys())
+    for f in f1 & f2:
+        hunks1 = set(''.join(h) for h in d1[f])
+        hunks2 = set(''.join(h) for h in d2[f])
+        d1new[f] = [h for h in d1[f] if ''.join(h) not in hunks2]
+        d2new[f] = [h for h in d2[f] if ''.join(h) not in hunks1]
+    return d1new, d2new
+
+
 def find_suspicious_hunks(dxM, dYx):
     '''Generate hunkwise interdiffs, trying to find a good match.'''
     # FIXME: this quick&dirty version assumes a single merge-base
@@ -156,11 +170,14 @@ def detect_evilness(M, A, B, bases):
     dBM = get_diff(B, M)
     dYA = [get_diff(Y, A) for Y in bases]
     dYB = [get_diff(Y, B) for Y in bases]
+    for i in range(len(bases)):
+        dYA[i], dYB[i] = remove_common_hunks(dYA[i], dYB[i])
     idiff_A = find_suspicious_hunks(dAM, dYB)
     idiff_B = find_suspicious_hunks(dBM, dYA)
     if idiff_A or idiff_B:
         print 'commit %s' % M
-        print 'merge bases', ','.join(abbrev(Y) for Y in bases)
+        print 'parents', abbrev(A), abbrev(B)
+        print 'merge bases', ' '.join(abbrev(Y) for Y in bases)
     print_idiff(idiff_A, "suspicious hunks from %s..%s" % (abbrev(A), abbrev(M)))
     print_idiff(idiff_B, "suspicious hunks from %s..%s" % (abbrev(B), abbrev(M)))
 
